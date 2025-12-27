@@ -116,7 +116,19 @@ def register_model_loader(load_format: str):
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
-    """Get a model loader based on the load format."""
+    """Get a model loader based on the load format.
+
+    Selects the appropriate loader implementation based on load_format:
+    - "auto": DefaultModelLoader (HuggingFace format)
+    - "dummy": DummyModelLoader (random weights for testing)
+    - "safetensors": DefaultModelLoader (SafeTensors format)
+    - "tensorizer": TensorizerLoader (optimized binary format)
+    - "bitsandbytes": BitsAndBytesModelLoader (quantized weights)
+    - "gguf": GGUFModelLoader (llama.cpp format)
+
+    Returns:
+        Configured model loader instance ready to call load_model()
+    """
     load_format = load_config.load_format
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")

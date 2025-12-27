@@ -291,7 +291,35 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
-        """
+        """Execute attention computation using selected backend (FlashAttention, PagedAttention, etc.).
+
+        EXECUTION CHAIN STEP 6 (called from LlamaAttention.forward):
+        This is the FINAL step before actual GPU kernel execution. This method:
+        1. Gets attention metadata (block tables, slot mapping) from forward context
+        2. Calls self.impl.forward() which invokes the actual attention backend
+        3. The backend (FlashAttention, PagedAttention, XFormers, etc.) runs GPU kernels
+
+        ⭐⭐⭐ PAGED ATTENTION EXECUTION PATH ⭐⭐⭐
+
+        CRITICAL LINE: self.impl.forward(...) [line 337 or 352]
+        → self.impl is an attention backend implementation instance
+        → Created during __init__ via: self.impl = attn_backend.get_impl_cls()(...)
+        → Possible backends (selected at runtime based on hardware/config):
+          * FlashAttention: flash_attn kernel (optimized for GPU)
+          * PagedAttention: vLLM's custom paged_attention kernel
+          * XFormers: memory_efficient_attention
+          * Torch SDPA: torch.nn.functional.scaled_dot_product_attention
+          * FlashInfer: flashinfer kernel
+
+        The backend implementation uses AttentionMetadata to:
+        - Read block_tables: Maps each sequence to its KV cache blocks
+        - Read slot_mapping: Determines where to write new K/V values
+        - Access self.kv_cache: The actual paged memory buffer
+        - Execute GPU kernel: compute attention(Q, cached_K, cached_V)
+
+        AttentionMetadata was created earlier in GPUModelRunner._build_attention_metadata()
+        and contains all the information needed for paged KV cache management.
+
         The KV cache is stored inside this class and is accessed via
         `self.kv_cache`.
 
@@ -315,11 +343,14 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
+        # === PATH 1: Backends that accept pre-allocated output buffer ===
         if self.use_output:
+            # Pre-allocate output tensor for efficiency
             output_shape = output_shape if output_shape is not None else query.shape
             output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
             hidden_size = output_shape[-1]
-            # Reshape the query, key, and value tensors.
+
+            # Reshape tensors to [num_tokens, num_heads, head_size]
             # NOTE(woosuk): We do this outside the custom op to minimize the
             # CPU overheads from the non-CUDA-graph regions.
             query = query.view(-1, self.num_heads, self.head_size)
@@ -328,31 +359,58 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size)
+
             if self.use_direct_call:
+                # Get attention metadata from forward context
+                # This contains block_tables, slot_mapping, sequence_lens, etc.
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
+
+                # Get KV cache for current virtual engine (for pipeline parallelism)
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+                # ⭐⭐⭐ CRITICAL: Call attention backend implementation ⭐⭐⭐
+                # This executes the actual GPU kernel (FlashAttention, PagedAttention, etc.)
+                # The backend uses attn_metadata.block_tables to find KV cache blocks
+                # and writes new K/V values to locations specified by slot_mapping.
+                #
+                # Typical flow inside self.impl.forward():
+                # 1. Write new K, V to KV cache using slot_mapping
+                # 2. Read cached K, V from blocks using block_tables
+                # 3. Compute attention(Q, cached_K, cached_V) using GPU kernel
+                # 4. Write output to the pre-allocated output buffer
                 self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )
             else:
+                # Wrapped in custom op for torch.compile compatibility
+                # (CUDA/ROCm platforms only)
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name
                 )
             return output.view(-1, hidden_size)
+
+        # === PATH 2: Backends that allocate output internally ===
         else:
             if self.use_direct_call:
+                # Get attention metadata from forward context
                 forward_context = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
+
+                # Get KV cache for current virtual engine
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+                # ⭐⭐⭐ CRITICAL: Call attention backend implementation ⭐⭐⭐
+                # Same as above, but backend allocates output buffer internally
                 return self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata
                 )
             else:
+                # Wrapped in custom op for torch.compile compatibility
                 return torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name
                 )

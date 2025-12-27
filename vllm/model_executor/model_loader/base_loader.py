@@ -37,21 +37,43 @@ class BaseModelLoader(ABC):
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
     ) -> nn.Module:
-        """Load a model with the given configurations."""
+        """Load a model with the given configurations.
+
+        Flow:
+        1. Initialize model architecture (empty model with correct structure)
+        2. Load weights from disk/HuggingFace Hub into model
+        3. Apply quantization and post-processing
+        4. Set model to evaluation mode
+
+        Returns:
+            Loaded PyTorch model ready for inference on target device
+        """
         device_config = vllm_config.device_config
         load_config = vllm_config.load_config
+        # Determine which device to load weights onto (usually GPU)
         load_device = (
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
+
+        # Set default dtype for weight initialization (fp16, bf16, fp32, etc.)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                # Step 1: Initialize model architecture (empty weights)
+                # Creates the model structure based on HuggingFace config
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config
                 )
 
             logger.debug("Loading weights on %s ...", load_device)
+
+            # Step 2: Load actual weights from disk/HF Hub
+            # Downloads from HuggingFace if not cached
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
+
+            # Step 3: Post-processing (quantization, dtype conversion, etc.)
             process_weights_after_loading(model, model_config, target_device)
+
+        # Step 4: Set to evaluation mode (disables dropout, etc.)
         return model.eval()

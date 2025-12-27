@@ -754,14 +754,20 @@ class GPUModelRunner(
         torch.cuda.synchronize()
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
-        """Update the cached states and the persistent batch with the scheduler
-        output.
+        """Update the cached states and the persistent batch with the scheduler output.
 
-        The updated states are used by the `_prepare_inputs` function to create
-        the input GPU tensors for the model.
+        Maintains self.input_batch (persistent batch state) across execution steps.
 
-        The SamplingMetadata is updated and copied to the GPU if there is a
-        new/resumed/paused/finished request in the batch.
+        Key operations:
+        - Remove finished requests from batch
+        - Remove unscheduled (preempted) requests
+        - Add new requests to batch
+        - Update resumed requests
+        - Update sequence lengths and block tables
+        - Update sampling metadata (temperature, top_k, etc.)
+
+        The updated states are used by `_prepare_inputs` to create input GPU tensors.
+        The SamplingMetadata is updated and copied to GPU if there are new/resumed requests.
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -1299,10 +1305,19 @@ class GPUModelRunner(
         torch.Tensor,
         SpecDecodeMetadata | None,
     ]:
-        """
-        :return: tuple[
-            logits_indices, spec_decode_metadata,
-        ]
+        """Prepare input tensors and compute logits indices.
+
+        Converts request data → flattened token tensors for GPU processing.
+
+        Key operations:
+        - Computes logits_indices: positions where we need to sample tokens
+          (last token of each sequence)
+        - Prepares token IDs, positions, embeddings
+        - Copies block tables to GPU for PagedAttention
+
+        Returns:
+            logits_indices: Tensor indices of positions to sample [num_reqs]
+            spec_decode_metadata: Metadata for speculative decoding
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
@@ -1528,8 +1543,18 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
-        """
-        :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+        """Build attention metadata for PagedAttention.
+
+        CRITICAL: This tells attention kernels where to find KV cache blocks.
+        Contains block tables (KV cache pointers), sequence lengths, and query positions.
+
+        Returns:
+            attn_metadata: Per-layer attention metadata with:
+                - block_table: Maps sequence → KV cache block IDs [num_reqs, max_blocks]
+                - slot_mapping: Maps token positions → KV cache slots [num_tokens]
+                - seq_lens: Sequence lengths [num_reqs]
+                - query_start_loc: Cumulative query positions [num_reqs + 1]
+            spec_decode_common_attn_metadata: Shared metadata for speculative decoding
         """
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
@@ -2548,6 +2573,18 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
+        """Convert scheduler output to GPU tensors ready for model forward pass.
+
+        Handles multimodal inputs (images/audio), prompt embeddings, and encoder-decoder models.
+
+        Returns:
+            input_ids: Token IDs [num_tokens] or None (if using embeddings)
+            inputs_embeds: Input embeddings [num_tokens, hidden_size] or None
+            positions: Position indices for positional encoding [num_tokens]
+            intermediate_tensors: For pipeline parallelism (hidden states from prev stage)
+            model_kwargs: Additional model arguments (encoder_outputs, etc.)
+            ec_connector_output: Encoder-cache connector output (for multimodal)
+        """
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -2831,20 +2868,40 @@ class GPUModelRunner(
     ) -> Any:
         """Helper method to call the model forward pass.
 
+        ⭐ THIS IS THE ACTUAL NEURAL NETWORK EXECUTION ⭐
+        Calls self.model() which runs the transformer layers with PagedAttention.
+        This is where the GPU computes hidden states from input tokens.
+
+        EXECUTION CHAIN (what happens next):
+        1. self.model() is a HuggingFace model instance (e.g., LlamaForCausalLM)
+        2. LlamaForCausalLM.forward() → calls self.model() (LlamaModel)
+           [vllm/model_executor/models/llama.py:622]
+        3. LlamaModel.forward() → loops through decoder layers
+           [vllm/model_executor/models/llama.py:418]
+        4. LlamaDecoderLayer.forward() → runs attention + MLP
+           [vllm/model_executor/models/llama.py:336]
+        5. LlamaAttention.forward() → QKV projection + PagedAttention
+           [vllm/model_executor/models/llama.py:241]
+
         This method can be overridden by subclasses for model execution.
         Motivation: We can inspect only this method versus
         the whole execute_model, which has additional logic.
 
         Args:
-            input_ids: Input token IDs
-            positions: Token positions
-            intermediate_tensors: Tensors from previous pipeline stages
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            **model_kwargs: Additional model arguments
+            input_ids: Input token IDs [num_tokens]
+            positions: Token positions for positional encoding [num_tokens]
+            intermediate_tensors: Tensors from previous pipeline stages (PP)
+            inputs_embeds: Input embeddings (alternative to input_ids, for multimodal)
+            **model_kwargs: Additional model arguments (attention_mask, etc.)
 
         Returns:
-            Model output tensor
+            Model output tensor (hidden_states [num_tokens, hidden_size])
         """
+        # ⭐ Execute HuggingFace model's forward() method ⭐
+        # This runs all transformer layers with PagedAttention for KV cache.
+        # For Llama models, this calls LlamaForCausalLM.forward()
+        # which then delegates to LlamaModel.forward() to run the layer loop.
+        # See execution chain in docstring above.
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -2895,6 +2952,17 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        """Determine how to execute this batch: CUDA graph mode and padding strategy.
+
+        CRITICAL: This method decides the execution strategy for maximum performance.
+
+        Returns:
+            cudagraph_mode: FULL (use CUDA graph), PARTIAL, or NONE (eager execution)
+            batch_descriptor: Contains padded num_tokens and num_reqs for CUDA graph
+            should_ubatch: Whether to use microbatching (DBO - Dynamic Batching Optimization)
+            num_tokens_across_dp: Total tokens across data parallel ranks (for coordination)
+            cudagraph_stats: Statistics about CUDA graph usage
+        """
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -3037,12 +3105,22 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        """Execute model forward pass on GPU.
+
+        Flow: Preprocessing → Forward Pass → Postprocessing → Store State
+        Returns None and stores results in self.execute_model_state.
+        Caller must then call sample_tokens() to get actual output.
+        This allows grammar constraints to be computed between forward and sampling.
+        """
+        # === SECTION 1: STATE VALIDATION ===
+        # Ensure sample_tokens() consumed previous execute_model() results
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
 
+        # Speculative decoding: deepcopy to avoid modifying engine core's scheduler_output
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -3057,12 +3135,15 @@ class GPUModelRunner(
         ):
             scheduler_output = deepcopy(scheduler_output)
 
+        # === SECTION 2: PREPROCESSING ===
+        # Prepare GPU state, metadata, and determine execution mode
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
-                # Update persistent batch states.
+                # Update batch state (req_ids, sequence lengths, block tables, etc.)
                 self._update_states(scheduler_output)
 
+                # Multimodal: if this worker produces encoder outputs, run encoder and return early
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -3071,6 +3152,7 @@ class GPUModelRunner(
                         self._execute_mm_encoder(scheduler_output)
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
+                # Early exit: no tokens scheduled (all requests paused/waiting)
                 if not num_scheduled_tokens:
                     if (
                         self.parallel_config.distributed_executor_backend
@@ -3097,6 +3179,7 @@ class GPUModelRunner(
                         "it when the requests need prompt logprobs"
                     )
 
+                # Compute basic metadata about batch
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -3104,6 +3187,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+                # Prepare inputs: logits_indices = which positions need sampling (last token of each seq)
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -3122,6 +3206,10 @@ class GPUModelRunner(
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                # CRITICAL: Determine execution strategy
+                # - cudagraph_mode: FULL (fastest), PARTIAL, or NONE
+                # - should_ubatch: split into microbatches (DBO)
+                # - batch_desc: padded dimensions for CUDA graphs
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -3146,6 +3234,7 @@ class GPUModelRunner(
                     num_tokens_across_dp,
                 )
 
+                # Extract padded dimensions and create microbatch slices
                 num_tokens_padded = batch_desc.num_tokens
                 num_reqs_padded = (
                     batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -3169,6 +3258,8 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+                # CRITICAL: Build attention metadata (block tables, seq lens, KV cache pointers)
+                # This tells PagedAttention where to find KV cache blocks for each sequence
                 (attn_metadata, spec_decode_common_attn_metadata) = (
                     self._build_attention_metadata(
                         num_tokens=num_tokens_unpadded,
@@ -3184,6 +3275,7 @@ class GPUModelRunner(
                     )
                 )
 
+            # Preprocess: convert scheduler_output → GPU tensors (token_ids, positions, embeddings)
             (
                 input_ids,
                 inputs_embeds,
@@ -3203,9 +3295,12 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # === SECTION 3: MODEL FORWARD PASS ===
+        # ⭐⭐⭐ THIS IS WHERE THE GPU RUNS THE NEURAL NETWORK ⭐⭐⭐
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
+            # Set global context so attention layers can access metadata
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3218,6 +3313,7 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # Execute transformer layers with PagedAttention
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3226,7 +3322,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # === SECTION 4: POSTPROCESSING ===
+        # Extract hidden states and compute logits
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            # Extract hidden states from model output
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -3237,6 +3336,7 @@ class GPUModelRunner(
 
             if not self.broadcast_pp_output:
                 # Common case.
+                # Pipeline parallelism: non-final ranks return intermediate tensors
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
@@ -3244,6 +3344,7 @@ class GPUModelRunner(
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
+                # Pooling models (BERT, embeddings): return pooled output instead of logits
                 if self.is_pooling_model:
                     # Return the pooling output.
                     output = self._pool(
@@ -3252,14 +3353,18 @@ class GPUModelRunner(
                     output.kv_connector_output = kv_connector_output
                     return output
 
+                # Extract hidden states at sampling positions and compute logits
+                # logits_indices = last token position of each sequence
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self.model.compute_logits(sample_hidden_states)  # Apply LM head
             else:
-                # Rare case.
+                # Rare case: broadcast_pp_output enabled
+                # Pipeline parallelism: broadcast logits from last rank to all ranks
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    # Non-last rank: send hidden states to last rank
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.vllm_config, num_tokens_padded
@@ -3272,8 +3377,10 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    # Last rank: compute logits
                     logits = self.model.compute_logits(sample_hidden_states)
 
+                # Broadcast logits from last rank to all ranks
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
                     model_output_broadcast_data["logits"] = logits.contiguous()
@@ -3284,9 +3391,12 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # === SECTION 5: STORE STATE AND RETURN ===
+        # Store all results in execute_model_state for sample_tokens() to consume
+        # Returns None - caller must call sample_tokens() next
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
-            logits,
+            logits,  # [num_samples, vocab_size] - vocabulary scores for sampling
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -3296,12 +3406,29 @@ class GPUModelRunner(
             cudagraph_stats,
         )
         self.kv_connector_output = kv_connector_output
-        return None
+        return None  # Deferred execution: sample_tokens() will do actual sampling
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        """Sample tokens from logits produced by execute_model().
+
+        Called immediately after execute_model() which returns None.
+        This separation allows grammar constraints to be computed between forward and sampling.
+
+        Flow:
+        1. Retrieve logits from self.execute_model_state
+        2. Apply grammar constraints (structured outputs)
+        3. Call sampler to select token IDs from probability distribution
+        4. Return ModelRunnerOutput with sampled token IDs
+
+        Args:
+            grammar_output: Grammar bitmask for structured output constraints
+
+        Returns:
+            ModelRunnerOutput with sampled_token_ids [num_samples]
+        """
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -3697,15 +3824,30 @@ class GPUModelRunner(
             setattr(self, config_name, new_config)
 
     def load_model(self, eep_scale_up: bool = False) -> None:
-        """
+        """Load model weights from disk/HuggingFace Hub onto GPU.
+
+        Flow:
+        1. Get appropriate model loader (HF, Tensorizer, etc.)
+        2. Load model weights onto GPU
+        3. Load LoRA adapters if configured
+        4. Load drafter model for speculative decoding
+        5. Configure EAGLE3 auxiliary layers
+        6. Wrap model with CUDA graph or microbatch wrapper
+        7. Prepare communication buffers for distributed execution
+
         Args:
             eep_scale_up: the model loading is for elastic EP scale up.
+
+        Raises:
+            torch.cuda.OutOfMemoryError: If insufficient GPU memory for model weights
         """
         logger.info_once(
             "Starting to load model %s...",
             self.model_config.model,
             scope="global",
         )
+        # === SECTION 1: INITIALIZATION ===
+        # EPLB (Expert Parallel Load Balancing) state for MoE models
         global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
             EplbState.get_eep_state(self.parallel_config)
             if eep_scale_up
@@ -3716,17 +3858,27 @@ class GPUModelRunner(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
+        # === SECTION 2: MODEL LOADING ===
         try:
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
+
+                # Get model loader: HuggingFace, Tensorizer, or SafeTensors
                 model_loader = get_model_loader(self.load_config)
+
+                # ⭐ LOAD MODEL WEIGHTS ONTO GPU ⭐
+                # Downloads from HuggingFace Hub if needed, applies quantization
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+
+                # Load LoRA adapters if configured (for fine-tuning)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+
+                # === SPECULATIVE DECODING: Load drafter model ===
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
@@ -3766,6 +3918,7 @@ class GPUModelRunner(
                         )
                         eplb_models += 1
 
+                # === EAGLE3 CONFIGURATION: Set auxiliary hidden state layers ===
                 if self.use_aux_hidden_state_outputs:
                     if not supports_eagle3(self.get_model()):
                         raise RuntimeError(
@@ -3773,6 +3926,7 @@ class GPUModelRunner(
                             "aux_hidden_state_outputs was requested"
                         )
 
+                    # EAGLE3: advanced speculative decoding using auxiliary hidden states
                     # Try to get auxiliary layers from speculative config,
                     # otherwise use model's default layers
                     aux_layers = self._get_eagle3_aux_layers_from_config()
@@ -3786,6 +3940,7 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
                 time_after_load = time.perf_counter()
+            # Record memory used by model weights
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
             msg = (
@@ -3804,11 +3959,16 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+
+        # === SECTION 3: POST-LOAD CONFIGURATION ===
+        # Prepare communication buffers for tensor/pipeline parallelism
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)
         ):
             prepare_communication_buffer_for_model(drafter_model)
+
+        # Configure multimodal pruning (remove unused image tokens)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -3816,6 +3976,7 @@ class GPUModelRunner(
             and mm_config.is_multimodal_pruning_enabled()
         )
 
+        # === MoE MODELS: Configure Expert Parallel Load Balancing ===
         if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
             logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
             global_expert_load = (
@@ -3837,6 +3998,8 @@ class GPUModelRunner(
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
+        # === SECTION 4: MODEL COMPILATION/WRAPPING ===
+        # Option 1: Stock PyTorch compile (torch.compile)
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -3846,20 +4009,24 @@ class GPUModelRunner(
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
             return
+
+        # Option 2: vLLM CUDA graph optimization (faster than torch.compile for LLMs)
         # for other compilation modes, cudagraph behavior is controlled by
         # CudagraphWraper and CudagraphDispatcher of vllm.
 
-        # wrap the model with full cudagraph wrapper if needed.
+        # Wrap model with CUDA graph wrapper for maximum performance
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         if (
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
         ):
+            # CUDA graphs: pre-record GPU operations for faster execution
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
         elif self.parallel_config.use_ubatching:
+            # Microbatching (DBO): split large batches into smaller ones
             if cudagraph_mode.has_full_cudagraphs():
                 self.model = UBatchWrapper(
                     self.model, self.vllm_config, CUDAGraphMode.FULL, self.device

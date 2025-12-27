@@ -243,13 +243,74 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """Multi-head self-attention with PagedAttention and rotary embeddings.
+
+        EXECUTION CHAIN STEP 5 (called from LlamaDecoderLayer.forward):
+        This is where the actual attention computation happens. The key innovation
+        is PagedAttention which uses block tables to manage KV cache efficiently.
+
+        CRITICAL OPERATION - PagedAttention:
+        → self.attn(q, k, v) computes attention using cached K and V
+        → K and V are stored in paged KV cache (managed by block tables)
+        → Block tables were set up in GPUModelRunner._build_attention_metadata()
+        → This enables efficient batching of sequences with different lengths
+        → vLLM's key innovation that enables high throughput
+
+        Attention backends (selected at runtime):
+        - FlashAttention: Optimized attention kernel for GPU
+        - PagedAttention: vLLM's custom kernel for KV cache
+        - XFormers: Memory-efficient attention
+        - Torch SDPA: PyTorch scaled dot-product attention
+
+        Args:
+            positions: Token positions for rotary embeddings [num_tokens]
+            hidden_states: Input from previous layer [num_tokens, hidden_size]
+
+        Returns:
+            Attention output [num_tokens, hidden_size]
+        """
+        # === STEP 1: QKV Projection ===
+        # Project hidden_states to Query, Key, Value
+        # For GQA (Grouped Query Attention): Multiple query heads per KV head
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # === STEP 2: Rotary Position Embeddings (RoPE) ===
+        # Apply rotary embeddings to Q and K for positional information
+        # This encodes relative positions without absolute position embeddings
         q, k = self.rotary_emb(positions, q, k)
+
+        # === STEP 3: Optional Llama 4 Scaling ===
+        # Llama 4 uses context-dependent attention scaling for long sequences
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
+
+        # === STEP 4: ⭐⭐⭐ PAGED ATTENTION - THE CORE vLLM INNOVATION ⭐⭐⭐ ===
+        # This is where K and V are stored in/retrieved from the paged KV cache.
+        # The attention backend (FlashAttention, PagedAttention, XFormers, etc.)
+        # uses block tables to find K/V blocks for each sequence in the batch.
+        #
+        # Block tables were set up earlier in:
+        # GPUModelRunner._build_attention_metadata() → creates AttentionMetadata
+        # AttentionMetadata contains:
+        #   - block_tables: Maps sequence_id → [block_ids] for KV cache
+        #   - slot_mapping: Where to write new K/V values
+        #   - sequence_lens: Length of each sequence
+        #
+        # The attention kernel uses these to:
+        # 1. Store new K, V into cache blocks (for new tokens)
+        # 2. Read cached K, V from blocks (for context)
+        # 3. Compute attention(Q, cached_K, cached_V)
+        #
+        # This paged memory management is what enables vLLM to:
+        # - Batch requests with different sequence lengths efficiently
+        # - Handle dynamic sequence lengths (prefill + decode)
+        # - Share KV cache blocks across sequences (for prefix sharing)
         attn_output = self.attn(q, k, v)
+
+        # === STEP 5: Output Projection ===
+        # Project attention output back to hidden_size
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -339,17 +400,50 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+        """Single Llama transformer decoder layer: Self-Attention + MLP.
+
+        EXECUTION CHAIN STEP 4 (called from LlamaModel.forward layer loop):
+        This is one layer of the transformer. Standard architecture:
+        1. LayerNorm → Self-Attention → Residual
+        2. LayerNorm → MLP → Residual
+
+        WHAT HAPPENS NEXT:
+        → self.self_attn() calls LlamaAttention.forward() [line 241]
+        → LlamaAttention computes Q, K, V projections
+        → ⭐ PAGED ATTENTION: self.attn(q, k, v) is the critical KV cache operation ⭐
+        → MLP feedforward network (gate + up + down projections)
+
+        Args:
+            positions: Token positions for rotary embeddings [num_tokens]
+            hidden_states: Input activations [num_tokens, hidden_size]
+            residual: Residual connection from previous layer
+
+        Returns:
+            (hidden_states, residual): Updated activations and residual
+        """
+        # === PART 1: Self-Attention with Residual Connection ===
+        # RMSNorm before attention (Pre-LN architecture)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # Fused layernorm that also updates residual
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # ⭐ Call LlamaAttention.forward() ⭐
+        # This computes multi-head self-attention with PagedAttention for KV cache.
+        # PagedAttention is the key vLLM optimization that enables efficient batching.
+        # See llama.py:241 for attention implementation.
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
-        # Fully Connected
+        # === PART 2: MLP (Feedforward) with Residual Connection ===
+        # RMSNorm before MLP
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # MLP: Two-layer feedforward with SwiGLU activation
+        # Projects hidden_size → intermediate_size → hidden_size
         hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -422,32 +516,77 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Forward pass through all Llama transformer decoder layers.
+
+        EXECUTION CHAIN STEP 3 (called from LlamaForCausalLM.forward):
+        This is the core transformer computation. Loops through decoder layers,
+        each running self-attention + MLP with residual connections.
+
+        WHAT HAPPENS NEXT:
+        1. Token embedding lookup (if first pipeline stage)
+        2. ⭐ LAYER LOOP: For each decoder layer, call layer.forward() ⭐
+           → Each layer is a LlamaDecoderLayer [line 336]
+           → Runs self-attention with PagedAttention
+           → Runs MLP feedforward network
+        3. Final layer normalization
+        4. Return hidden states to LlamaForCausalLM
+
+        Pipeline Parallelism (PP) support:
+        - First rank: Converts input_ids → embeddings
+        - Middle ranks: Receives hidden_states from previous rank
+        - Last rank: Applies final norm before LM head
+
+        Args:
+            input_ids: Input token IDs [num_tokens]
+            positions: Token positions for rotary embeddings [num_tokens]
+            intermediate_tensors: Hidden states from previous PP rank
+            inputs_embeds: Pre-computed embeddings (for multimodal)
+
+        Returns:
+            Final hidden states [num_tokens, hidden_size]
+        """
+        # === STEP 1: Get initial hidden states ===
         if get_pp_group().is_first_rank:
+            # First pipeline stage: Convert tokens to embeddings
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
+            # Middle/last pipeline stage: Receive from previous rank
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # === STEP 2: ⭐ LOOP THROUGH DECODER LAYERS ⭐ ===
+        # This is where the actual transformer computation happens.
+        # Each layer runs self-attention (with PagedAttention for KV cache)
+        # followed by MLP, with residual connections.
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            # Auxiliary outputs for some models (e.g., vision encoders)
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+
+            # ⭐ Call LlamaDecoderLayer.forward() ⭐
+            # This runs: LayerNorm → Attention → LayerNorm → MLP
+            # See llama.py:336 for decoder layer implementation
             hidden_states, residual = layer(positions, hidden_states, residual)
 
+        # === STEP 3: Pipeline parallelism handling ===
         if not get_pp_group().is_last_rank:
+            # Not last stage: Send hidden_states to next rank
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        # === STEP 4: Final layer normalization (last rank only) ===
         hidden_states, _ = self.norm(hidden_states, residual)
 
+        # Return final hidden states (will be projected to vocabulary by LM head)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -626,6 +765,29 @@ class LlamaForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        """Forward pass for Llama language model with causal LM head.
+
+        EXECUTION CHAIN STEP 2 (called from GPUModelRunner._model_forward):
+        This method delegates to LlamaModel.forward() which runs the actual
+        transformer layers. This class mainly exists to add the LM head on top.
+
+        WHAT HAPPENS NEXT:
+        → self.model() calls LlamaModel.forward() [line 418]
+        → LlamaModel loops through decoder layers
+        → Each layer runs self-attention + MLP
+        → Returns final hidden states
+
+        Args:
+            input_ids: Input token IDs [num_tokens]
+            positions: Token positions for rotary embeddings [num_tokens]
+            intermediate_tensors: Tensors from previous pipeline stage (PP)
+            inputs_embeds: Pre-computed embeddings (for multimodal)
+
+        Returns:
+            Hidden states from final layer [num_tokens, hidden_size]
+        """
+        # Delegate to LlamaModel which contains the actual transformer layers.
+        # After this returns, compute_logits() will project hidden_states to vocabulary.
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
